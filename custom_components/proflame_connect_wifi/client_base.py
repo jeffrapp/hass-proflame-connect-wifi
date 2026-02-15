@@ -52,6 +52,8 @@ class ProflameClientBase:
         self._connection = None
 
         self._state = {}
+        self._uses_indexed_format = False
+        self._state_received = asyncio.Event()
 
     def __enter__(self):
         """Initiate a connection for a context manager."""
@@ -85,6 +87,26 @@ class ProflameClientBase:
             for task in tasks or []:
                 task.cancel()
 
+    def _format_command(self, item: dict) -> str:
+        """Format a command for sending to the fireplace.
+
+        Newer firmware expects: {"control0": "main_mode", "value0": "5", "control1": "attr", "value1": "value"}
+        The main_mode: 5 enables WiFi/app control mode.
+        Older firmware expects: {"attr": value}
+        """
+        if self._uses_indexed_format:
+            # Convert {attr: value} to include main_mode:5 for WiFi control
+            if len(item) == 1:
+                attr, value = next(iter(item.items()))
+                return json.dumps({
+                    "control0": "main_mode",
+                    "value0": "5",
+                    "control1": attr,
+                    "value1": str(value)
+                }, separators=(',', ':'))
+        # Fall back to simple format for older firmware
+        return json.dumps(item, separators=(',', ':'))
+
     async def _dispatcher(self) -> None:
         """Handle the sending of messages in an interruption safe way."""
         item = None
@@ -92,7 +114,7 @@ class ProflameClientBase:
             try:
                 if item is None:
                     item = await self._queue.get()
-                await self._send(json.dumps(item))
+                await self._send(self._format_command(item))
                 self._queue.task_done()
                 item = None
             except asyncio.CancelledError:
@@ -110,18 +132,53 @@ class ProflameClientBase:
         else:
             self._warning("Received unexpected control message (%s)", message)
 
+    def _parse_indexed_format(self, message: dict) -> dict[str, int | str] | None:
+        """Parse indexed status/value format used by newer firmware.
+
+        Newer firmware sends: {"status0": "attr", "value0": "123", ...}
+        This converts to: {"attr": 123, ...}
+        """
+        if "status0" not in message:
+            return None
+
+        result = {}
+        i = 0
+        while f"status{i}" in message:
+            attr_name = message.get(f"status{i}")
+            value_str = message.get(f"value{i}")
+
+            if attr_name is not None and value_str is not None:
+                try:
+                    result[str(attr_name)] = int(value_str)
+                except (ValueError, TypeError):
+                    # Store non-numeric values as strings (e.g., firmware versions)
+                    result[str(attr_name)] = str(value_str)
+            i += 1
+
+        return result if result else None
+
     def _handle_json_message(self, message) -> None:
         """Process a system state message from the websocket."""
         err_msg = "Received unexpected JSON message (%s) - %s"
         if not isinstance(message, dict):
             self._warning(err_msg, "NOT_AN_OBJECT", json.dumps(message))
+            return
+
+        # Try to parse indexed format (status0/value0, status1/value1, etc.)
+        parsed = self._parse_indexed_format(message)
+        if parsed is not None:
+            self._uses_indexed_format = True
+            message = parsed
         elif any(not isinstance(x, int) for x in message.values()):
             self._warning(err_msg, "UNKNOWN_SCHEMA", json.dumps(message))
-        else:
-            for k, v in message.items():
-                self._state[k] = v
-                for callback in self._callbacks:
-                    callback(k, v)
+            return
+
+        for k, v in message.items():
+            self._state[k] = v
+            for callback in self._callbacks:
+                callback(k, v)
+        # Signal that we've received state (used for protocol detection)
+        self._state_received.set()
 
     def _handle_message(self, message):
         """Process a message from the websocket."""
@@ -180,6 +237,22 @@ class ProflameClientBase:
         """Connect to the Proflame websocket."""
         self._debug('Connection opening')
         self._connection = asyncio.create_task(self._connect())
+
+    async def wait_for_state(self, timeout: float = 10.0) -> bool:
+        """Wait for state to be received from the device.
+
+        This ensures the device protocol (indexed vs simple) is detected
+        before sending any commands.
+
+        :param timeout: Maximum time to wait for state.
+        :return: True if state was received, False if timeout.
+        """
+        try:
+            await asyncio.wait_for(self._state_received.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            self._warning('Timeout waiting for initial state from device')
+            return False
 
     def register_callback(self, callback) -> None:
         """Register a callback that will be triggered on state changes."""

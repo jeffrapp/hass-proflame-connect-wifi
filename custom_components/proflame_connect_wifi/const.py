@@ -41,6 +41,8 @@ class OperatingMode(IntEnum):
     MANUAL = 1
     THERMOSTAT = 2
     SMART = 3
+    # Mode 5 appears to be a WiFi/App control mode on newer firmware
+    WIFI = 5
 
 
 class PilotMode(IntEnum):

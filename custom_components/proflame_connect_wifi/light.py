@@ -54,14 +54,15 @@ class ProflameLight(ProflameEntity, LightEntity):
         brightness = self.brightness
         return None if brightness is None else brightness
 
-    def turn_on(self, **kwargs: Any) -> None:
+    async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the primary light on."""
         brightness = kwargs.get('brightness', None)
         if brightness is None:
             self._device.turn_on_light()
+            return
         converted = math.ceil(brightness / (255 / MAX_LIGHT_BRIGHTNESS))
         self._device.set_light_brightness(converted)
 
-    def turn_off(self, **kwargs: Any) -> None:
+    async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the primary light off."""
         self._device.set_light_brightness(0)
