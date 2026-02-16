@@ -46,7 +46,7 @@ class ProflameLight(ProflameEntity, LightEntity):
         brightness = self._device.light_brightness
         if brightness is None:
             return None
-        return brightness * int(255 / MAX_LIGHT_BRIGHTNESS)
+        return round(brightness * 255 / MAX_LIGHT_BRIGHTNESS)
 
     @property
     def is_on(self) -> bool | None:
