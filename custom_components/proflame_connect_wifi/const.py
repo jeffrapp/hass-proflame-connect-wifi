@@ -73,6 +73,7 @@ PROFLAME_COORDINATOR = "coordinator"
 ADJUSTABLE_MODES = [
     OperatingMode.MANUAL,
     OperatingMode.THERMOSTAT,
+    OperatingMode.WIFI,
 ]
 
 MAX_FAN_SPEED = 6
