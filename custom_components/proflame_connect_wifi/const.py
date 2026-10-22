@@ -67,6 +67,12 @@ DEFAULT_DEVICE = 'Proflame Fireplace'
 DEFAULT_NAME = 'Fireplace'
 DEFAULT_PORT = 88
 
+# Seconds between pings, and seconds of silence before the connection is dropped
+KEEPALIVE_INTERVAL = 5
+KEEPALIVE_TIMEOUT = 30
+# Seconds to wait before reconnecting after a dropped connection
+RECONNECT_DELAY = 5
+
 PROFLAME_CLIENT = "client"
 PROFLAME_COORDINATOR = "coordinator"
 

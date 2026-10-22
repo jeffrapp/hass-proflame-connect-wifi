@@ -3,11 +3,17 @@ import asyncio
 import json
 from json.decoder import JSONDecodeError
 import logging
+import time
 
-from websockets import ConnectionClosed, ConnectionClosedError
 from websockets.client import connect
 
-from .const import DEFAULT_PORT, ApiControl
+from .const import (
+    DEFAULT_PORT,
+    KEEPALIVE_INTERVAL,
+    KEEPALIVE_TIMEOUT,
+    RECONNECT_DELAY,
+    ApiControl,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,9 +51,11 @@ class ProflameClientBase:
         self._port = port or DEFAULT_PORT
         self._logger = logger or _LOGGER
         self._callbacks = []
+        self._connection_callbacks = []
 
         self._ws = None
-        self._shutdown = False
+        self._connected = False
+        self._last_recv = 0.0
         self._queue = asyncio.Queue()
         self._connection = None
 
@@ -65,27 +73,57 @@ class ProflameClientBase:
         self.close()
 
     async def _connect(self):
-        """Maintain an open connection to the websocket."""
-        tasks = []
+        """Maintain an open connection to the websocket, reconnecting as needed."""
+        dispatcher = asyncio.create_task(self._dispatcher())
         try:
             async for websocket in connect(self.uri, ping_interval=None):
                 self._debug('Connection opened')
+                self._ws = websocket
+                self._last_recv = time.monotonic()
+                # Listener and keepalive are bound to this specific connection.
+                # When either one finishes, the connection is considered dead.
+                tasks = [
+                    asyncio.create_task(self._listener(websocket)),
+                    asyncio.create_task(self._keepalive(websocket)),
+                ]
                 try:
-                    self._ws = websocket
-                    if not tasks:
-                        tasks = [
-                            asyncio.create_task(self._dispatcher()),
-                            asyncio.create_task(self._listener()),
-                            asyncio.create_task(self._keepalive()),
-                        ]
-                    await self._send(ApiControl.CONN_SYN)
+                    await websocket.send(ApiControl.CONN_SYN)
+                    self._set_connected(True)
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if not task.cancelled() and task.exception() is not None:
+                            self._warning('Connection lost: %s', task.exception())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err: # pylint: disable=broad-exception-caught
+                    self._warning('Connection failed: %s', err)
+                finally:
+                    self._set_connected(False)
+                    self._ws = None
+                    for task in tasks:
+                        task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                except (ConnectionClosed, ConnectionClosedError):
-                    msg = 'Attempting to reopen after connection closed unexpectedly'
-                    self._warning(msg)
+                    await websocket.close()
+                self._warning('Reconnecting in %s seconds', RECONNECT_DELAY)
+                await asyncio.sleep(RECONNECT_DELAY)
         except asyncio.CancelledError:
-            for task in tasks or []:
-                task.cancel()
+            pass
+        finally:
+            dispatcher.cancel()
+            await asyncio.gather(dispatcher, return_exceptions=True)
+
+    def _set_connected(self, connected: bool) -> None:
+        """Update connection state and notify listeners on change."""
+        if self._connected == connected:
+            return
+        self._connected = connected
+        if not connected:
+            # Drop pending commands rather than replaying stale ones on reconnect
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
+        for callback in self._connection_callbacks:
+            callback(connected)
 
     def _format_command(self, item: dict) -> str:
         """Format a command for sending to the fireplace.
@@ -108,20 +146,22 @@ class ProflameClientBase:
         return json.dumps(item, separators=(',', ':'))
 
     async def _dispatcher(self) -> None:
-        """Handle the sending of messages in an interruption safe way."""
-        item = None
+        """Handle the sending of queued commands."""
         while True:
+            item = await self._queue.get()
             try:
-                if item is None:
-                    item = await self._queue.get()
-                await self._send(self._format_command(item))
-                self._queue.task_done()
-                item = None
+                if self._ws is None:
+                    self._warning('Dropping command while disconnected (%s)', item)
+                else:
+                    await self._send(self._format_command(item))
             except asyncio.CancelledError:
-                break
-            except Exception: # pylint: disable=broad-exception-caught
-                self._exception('Unexpected error during send')
-                await asyncio.sleep(1)
+                raise
+            except Exception as err: # pylint: disable=broad-exception-caught
+                # Don't retry: the connection is being re-established, and
+                # replaying fireplace commands later could be surprising.
+                self._warning('Failed to send command (%s): %s', item, err)
+            finally:
+                self._queue.task_done()
 
     def _handle_control_message(self, message):
         """Process a system control/info message from the websocket."""
@@ -187,30 +227,33 @@ class ProflameClientBase:
         except JSONDecodeError:
             self._handle_control_message(message)
 
-    async def _keepalive(self):
-        """Send periodic messages to keep the websocket connection alive."""
-        while True:
-            try:
-                await asyncio.sleep(5)
-                await self._send(ApiControl.PING)
-            except asyncio.CancelledError:
-                break
-            except Exception: # pylint: disable=broad-exception-caught
-                self._exception('Unexpected error during ping')
-                await asyncio.sleep(1)
+    async def _keepalive(self, websocket) -> None:
+        """Ping the device periodically and return if it stops responding.
 
-    async def _listener(self):
-        """Handle receiving messages in a connection safe way."""
+        Returning (or raising) ends the connection and triggers a reconnect.
+        """
         while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            silence = time.monotonic() - self._last_recv
+            if silence > KEEPALIVE_TIMEOUT:
+                self._warning('No response from device in %.0f seconds', silence)
+                return
+            self._debug("SEND: %s", ApiControl.PING)
+            await websocket.send(ApiControl.PING)
+
+    async def _listener(self, websocket) -> None:
+        """Receive messages until the connection closes.
+
+        Connection errors propagate so the connection can be re-established.
+        """
+        async for message in websocket:
+            self._last_recv = time.monotonic()
+            self._debug('RECV: %s', message)
             try:
-                async for message in self._ws:
-                    self._debug('RECV: %s', message)
-                    self._handle_message(message)
-            except asyncio.CancelledError:
-                break
+                self._handle_message(message)
             except Exception: # pylint: disable=broad-exception-caught
-                self._exception('Unexpected error during receive')
-                await asyncio.sleep(1)
+                self._exception('Unexpected error handling message (%s)', message)
+        self._warning('Connection closed by device')
 
     async def _send(self, message) -> None:
         """Send message to the fireplace websocket."""
@@ -224,10 +267,12 @@ class ProflameClientBase:
             self._connection.cancel()
             await asyncio.gather(self._connection, return_exceptions=True)
             self._connection = None
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
         self._debug('Connection closed')
+
+    @property
+    def connected(self) -> bool:
+        """Return true if the websocket connection is currently open."""
+        return self._connected
 
     def get_state(self, field: str) -> int | None:
         """Query the state of the fireplace."""
@@ -257,6 +302,10 @@ class ProflameClientBase:
     def register_callback(self, callback) -> None:
         """Register a callback that will be triggered on state changes."""
         self._callbacks.append(callback)
+
+    def register_connection_callback(self, callback) -> None:
+        """Register a callback that will be triggered on connect/disconnect."""
+        self._connection_callbacks.append(callback)
 
     def set_state(self, field: str, value: int) -> None:
         """Send a state update to the fireplace."""
